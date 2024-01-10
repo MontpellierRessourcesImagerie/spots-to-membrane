@@ -1,0 +1,38 @@
+
+0. Preprocessing:
+   Le preprocessing est également appliqué sur les images utilisées pour l'entrainement de LabKit.
+   Les images reçoivent une coorection de background et sont normalisées entre 0.0 et 1.0.
+   La normalization se fait à l'échelle du stack, pas de chaque slice individuelle.
+
+1. Segmentation sémantique avec LabKit:
+   Qu'est-ce qui fait parti de la zone d'intéret ou non.
+   On termine avec la membrane et des morceaux de cytoplasmes en un bloc.
+
+2. Postprocessing:
+   Commencer par labéliser par connected components et retirer les morceaux les plus petits qui sont des débris.
+   On obtient des structures qui présentent des trous, le principal étant le cytoplasme.
+   On peut commencer par appliquer un closing 3D avec un kernel en diamant et un assez grand radius (~10)
+   On fini en faisant un fill holes 3D. Pour cela, il faut ajouter deux slices (début et fin) pour boucher les trous traversants.
+
+3. Points:
+   Les points sont pré-segmentés sur Imaris.
+   Il n'y a donc pas besoin de se focus sur la distinctions de cellules collées, car les points sont les sujets d'intéret.
+   Il n'y a pas de spot dans les structures "en trop".
+   Une simple chamfer distance en 3D peut être utilisée pour trouver la distance entre un spot et la membrane.
+
+==========  NOTES:  ==========
+
+- Il faut filtrer les points à l'ouverture pour qu'aucun ne tombre dans une zone segmentée en tant que background.
+- Le nombre de spots est important, ce n'est donc pas problématique d'avoir une marge d'erreur.
+
+/!\ Voir si Célia dispose de nouvelles images avec Felipe.
+
+========== TO-DO: ==========
+
+> Implémenter en Python la segmentation avec LabKit et le bouchage de trous.
+> Vérifier que la procédure pour boucher les trous fonctionne sur toutes les images du training set.
+> Vérifier que segmentation et réparation fonctionnent sur l'autre lot.
+> Envoyer screen à Célia et Felipe.
+> Récupérer des CSV qui contiennent des points.
+> Expliquer la situation à Célia pour les cellules non-séparées.
+> Vérifier la distance entre la segmentation et les vrais images.
