@@ -28,8 +28,8 @@ Description: Build a training set from a batch of images meant to be used with L
 _dp      = Duplicator()
 _channel = 3 # Channel of interest
 _ext     = ".ics" # Extension of images in the folder.
-_path    = "/home/benedetti/Desktop/imgs-felipe"
-_s_size  = 5 # Size (in slices) of a chunk from an image
+_path    = "/home/benedetti/Documents/projects/22-felipe-membrane-spots/imgs-felipe"
+_s_size  = 4 # Size (in slices) of a chunk from an image
 _cct     = Concatenator()
 _ce      = ContrastEnhancer()
 _m       = Mirror()
@@ -50,23 +50,25 @@ nFrames = 0
 
 for c in content:
     full_path = os.path.join(_path, c)
-    imIn = IJ.openImage(full_path)
+    imIn      = IJ.openImage(full_path)
+    channel   = _dp.run(imIn, _channel, _channel, 1, imIn.getNSlices(), 1, 1)
+    imIn.close()
 
     # Background correction of every slice
-    for s in range(imIn.getNSlices()):
-        imIn.setSlice(s)
-        _bs.rollingBallBackground(imIn.getProcessor(), 50.0, False, False, True, True, True)
+    for s in range(channel.getNSlices()):
+        channel.setSlice(s)
+        _bs.rollingBallBackground(channel.getProcessor(), 50.0, False, False, True, True, True)
 
     # Normalization of images
-    _ce.stretchHistogram(imIn, 0.1)
+    _ce.stretchHistogram(channel, 0.1)
 
-    for i in range(1, imIn.getNSlices()+1, _s_size):
+    for i in range(1, channel.getNSlices()+1, _s_size):
         start = i
         end   = start+_s_size-1
-        if (end > imIn.getNSlices()):
+        if (end > channel.getNSlices()):
             break
-        chunk = _dp.run(imIn, _channel, _channel, start, end, 1, 1)
         
+        chunk = _dp.run(channel, 1, 1, start, end, 1, 1)
         img = Image.wrap(chunk)
         a = Axes(
             randint(0, 1) != 0, 
@@ -79,14 +81,9 @@ for c in content:
 
         buffer.append(out)
         nFrames += 1
-    imIn.close()
+    channel.close()
 
 imOut = _cct.concatenate(buffer, False)
 imOut.setDimensions(1, _s_size, nFrames)
 imOut.show()
-
-
-
-
-
-
+print("DONE.")
