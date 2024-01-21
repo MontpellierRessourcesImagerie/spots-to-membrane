@@ -1,10 +1,12 @@
 import os
-from random import randint
+from random import shuffle
 
 from ij import IJ, WindowManager, ImagePlus, ImageStack
 from ij.plugin import Duplicator, Concatenator, ContrastEnhancer
 from ij.plugin.filter import BackgroundSubtracter
 from ij.process import ImageProcessor
+from ij.gui import WaitForUserDialog
+from ij.process import AutoThresholder
 
 from imagescience.image import Axes, Image, FloatImage
 from imagescience.transform import Mirror
@@ -41,92 +43,266 @@ def imaris_csv_loader(path):
         co = (float(items[xyz[0]]), float(items[xyz[1]]), float(items[xyz[2]]))
 
 
-class SpotsToMembrane(object):
+def background_correction(imIn, bg_roi=None, normalize=True):
+    bs = BackgroundSubtracter()
     
-    def __init__(self):
-        self.current = None # Current image we have to work on.
-        self.image_path = None
-        self.spots_path = None
-        self.membrane_channel = 3
-        self.membrane_label = 1
-        self.raw_seg_membrane = None
-        self.membrane_image = None
-        self.isBatch = False
-        self.queue = []
-        self.classifier_path = "/home/benedetti/Documents/projects/22-felipe-membrane-spots/01-classifier-cells/v4.classifier"
-        self.format = 'IMARIS'
-        self.exportIntermediates = True
-        self.tempDump = "/home/benedetti/Desktop/dump/"
-        self.noSpots = True
+    for s in range(1, imIn.getNSlices()+1):
+        imIn.setSlice(s)
+        prc = imIn.getProcessor()
+        bs.rollingBallBackground(prc, 50.0, False, False, True, True, True)
+        if bg_roi is not None:
+            prc.setRoi(bg_roi)
+            stats = prc.getStats()
+            prc.resetRoi()
+            prc.subtract(stats.mean * (1.0 + stats.stdDev * 2.0))
 
-    def nextImage(self):
-        pass
-
-    def _background_correction(self, imIn):
-        bs = BackgroundSubtracter()
-        for s in range(imIn.getNSlices()):
-            imIn.setSlice(s)
-            bs.rollingBallBackground(imIn.getProcessor(), 50.0, False, False, True, True, True)
-
-    def _preprocess(self):
-        if self.current.getNChannels() < self.membrane_channel:
-            print("Not enough channels in input image.")
-            return False
-        
-        dp = Duplicator()
-
+    if normalize:
         ce = ContrastEnhancer()
         ce.setNormalize(True)
         ce.setProcessStack(True)
         ce.setUseStackHistogram(False)
+        ce.stretchHistogram(imIn, 0.1)
+
+    if bg_roi is None:
+        return 
+    
+    for s in range(1, imIn.getNSlices()+1):
+        imIn.setSlice(s)
+        prc = imIn.getProcessor()
+        prc.setRoi(bg_roi)
+        stats = prc.getStats()
+        prc.resetRoi()
+        prc.subtract(stats.mean * (1.0 + stats.stdDev * 2.0))
+        prc.min(0.0)
+
+
+def isolate_labels(image, labels):
+    for s in range(1, image.getNSlices()+1):
+        image.setSlice(s)
+        prc = image.getProcessor()
+        for c in range(image.getWidth()):
+            for l in range(image.getHeight()):
+                val = int(prc.get(c, l))
+                if val not in labels:
+                    prc.set(c, l, 0)
+                else:
+                    prc.set(c, l, 255)
+    return image
+
+
+def segment_with_weka(imIn, classifier_path, labels=None, close_input=False):
+    if not (os.path.isfile(classifier_path) and classifier_path.endswith(".classifier")):
+        return None
+    
+    imgplus = ImagePlusAdapter.wrapImgPlus(imIn)
+    sc = SegmentationTool()
+
+    sc.openModel(classifier_path)
+    result = sc.segment(imgplus)
+    raw_seg_membrane = ImageJFunctions.wrap(result, "weka-result")
+    temp = raw_seg_membrane.duplicate()
+    raw_seg_membrane.close()
+    raw_seg_membrane = temp
+    raw_seg_membrane.setDimensions(imIn.getNChannels(), imIn.getNSlices(), imIn.getNFrames())
+
+    if labels is None:
+        return raw_seg_membrane
+
+    raw_seg_membrane = isolate_labels(raw_seg_membrane, labels)
+
+    if close_input:
+        imIn.close()
+
+    return raw_seg_membrane
+
+
+def threshold(image, method):
+    buffer = ImageStack(image.getWidth(), image.getHeight())
+    at = AutoThresholder()
+
+    image.setSlice(int((image.getNSlices()+1)/2))
+    prc = image.getProcessor()
+    stats = prc.getStats()
+    histo = [int(i) for i in stats.getHistogram()]
+    t = at.getThreshold(method, histo)
+    val = stats.histMin + t * stats.binSize
+
+    for s in range(1, image.getNSlices()+1):
+        image.setSlice(s)
+        prc = image.getProcessor()
+        prc.setThreshold(val, 1e30)
+        buffer.addSlice(prc.createMask())
+    
+    img = ImagePlus("cyto-mask", buffer)
+    return img
+
+
+class SpotsToMembrane(object):
+    
+    def __init__(self):
+        self.current = None # Image we are currently working on.
+        self.is_batch = False # Are we processing a full folder?
+        self.queue   = [] # Only used if 'is_batch' is set to True: List of images to process in the folder.
+        self.dump    = True # Should we dump intermediate steps as files on the disk?
+
+        self.spots_dir_path     = None # Path of the folder containing 
+        self.current_spots_path = None
+        self.current_title      = None # Clean title of the image we are currently working on.
+
+        self.bg_roi = None # ROI used to characterize the background (not unifom across the slices).
         
-        membrane = dp.run(
+        self.cyto_mask     = None # Mask of the cytoplasm.
+        self.nucleus_mask  = None # Mask of the nucleus.
+        self.membrane_mask = None # Mask of the membrane.
+        
+        self.membrane_classifier_path = "/home/benedetti/Documents/projects/22-felipe-membrane-spots/03-splits-classifier/v1.classifier"
+        self.csv_format = 'IMARIS'
+        
+        self.dump_path = "/home/benedetti/Desktop/dump/"
+        self.no_spots = False
+
+    
+    def _clear_state(self):
+        if self.current is not None:
+            self.current.close()
+            self.current = None
+        
+        if self.cyto_mask is not None:
+            self.cyto_mask.close()
+            self.cyto_mask = None
+
+        if self.nucleus_mask is not None:
+            self.nucleus_mask.close()
+            self.nucleus_mask = None
+
+        if self.membrane_mask is not None:
+            self.membrane_mask.close()
+            self.membrane_mask = None
+
+        self.current_spots_path = None
+        self.current_title = None
+        self.bg_roi = None
+
+    def set_spots_directory(self, folder):
+        if not os.path.isdir(folder):
+            print("The provided path is not an existing folder.")
+            return False
+        
+        self.spots_dir_path = folder
+        return True
+
+    def _get_working_data(self, capture):
+        if capture:
+            self.current = IJ.getImage()
+
+        if self.current is None:
+            print("The active element is not an image.")
+            return False
+        
+        self.current_title = ".".join(self.current.getTitle().split('.')[:-1])
+
+        if self.is_batch:
+            im2 = self.current.duplicate()
+            im2.show()
+            wfud = WaitForUserDialog("ROI required", "Draw an ROI over a patch of background.")
+            wfud.show()
+            self.bg_roi = im2.getRoi()
+            im2.close()
+        else:
+            self.bg_roi = self.current.getRoi()
+
+        if self.bg_roi is None:
+            print("A ROI over a piece of background is required.")
+            return False
+
+        if self.no_spots:
+            return True
+        
+        if not os.path.isdir(self.spots_dir_path):
+            print("The directory supposed to contains spots doesn't exist")
+            return False
+        
+        content = {f.lower(): f for f in os.listdir(self.spots_dir_path)}
+        prefix = self.current_title.lower()
+        target = None
+
+        for key, value in content.items():
+            if not key.startswith(prefix):
+                continue
+            target = value
+            break
+
+        if target is None:
+            print("Impossible to find the spots associated with: " + self.current_title)
+            return False
+
+        self.current_spots_path = os.path.join(self.spots_dir_path, target)
+
+        if not os.path.isfile(self.current_spots_path):
+            print("Failed to fetch the file: " + self.current_spots_path)
+            return False
+        
+        print("Found spots at: " + self.current_spots_path)
+        
+        return True
+
+    def _preprocess_cyto(self):
+        
+        dp = Duplicator()
+        
+        ch1 = dp.run(
             self.current, 
-            self.membrane_channel, 
-            self.membrane_channel, 
+            1,
+            1,
             1, 
             self.current.getNSlices(), 
             1, 
             1
         )
 
-        self._background_correction(membrane)
-        ce.stretchHistogram(membrane, 0.1)
-        self.membrane_image = membrane
+        background_correction(ch1, self.bg_roi)
+        
+        self.cyto_mask = ch1
 
-        if self.exportIntermediates:
-            IJ.saveAsTiff(self.membrane_image, os.path.join(self.tempDump, "preprocess-"+self.current.getTitle()))
+        if self.dump:
+            IJ.saveAsTiff(ch1, os.path.join(self.dump_path, "preprocess-"+self.current_title+".tif"))
+
+        return True
+    
+    def _segment_cyto(self):
+        rough_mask = threshold(self.cyto_mask, AutoThresholder.Method.Huang)
+        strel = Strel3D.Shape.OCTAGON.fromRadiusList(7, 7, 0)
+        c_mask = ImagePlus("c_mask", strel.closing(rough_mask.getStack()))
+        self.cyto_mask.close()
+        self.cyto_mask = c_mask
+
+        if self.dump:
+            IJ.saveAsTiff(self.cyto_mask, os.path.join(self.dump_path, "cyto-preprocessmask-rough-"+self.current_title+".tif"))
 
         return True
 
-    def _segment(self):
-        imgplus = ImagePlusAdapter.wrapImgPlus(self.membrane_image)
-        sc = SegmentationTool()
 
-        if not os.path.isfile(self.classifier_path) or not self.classifier_path.endswith(".classifier"):
-            print("Classifier not found.")
-            return False
-    
-        sc.openModel(self.classifier_path)
-        result = sc.segment(imgplus)
-        self.raw_seg_membrane = ImageJFunctions.wrap(result, "raw-segmentation-"+self.membrane_image.getTitle())
+    def _segment_membranes(self):
+        dp = Duplicator()
         
-        if self.exportIntermediates:
-            IJ.saveAsTiff(self.raw_seg_membrane, os.path.join(self.tempDump, "raw-seg-"+self.current.getTitle()))
+        ch3 = dp.run(
+            self.current, 
+            3,
+            3,
+            1, 
+            self.current.getNSlices(), 
+            1, 
+            1
+        )
 
-        self.membrane_image.close()
-        self.membrane_image = None
-
-        temp = LabelImages.keepLabels(self.raw_seg_membrane, [self.membrane_label])
-        self.raw_seg_membrane.close()
-        self.raw_seg_membrane = temp
-
-        IJ.setRawThreshold(self.raw_seg_membrane, 1, 65535)
-        IJ.run(self.raw_seg_membrane, "Convert to Mask", "background=Dark black")
-
-        if self.exportIntermediates:
-            IJ.saveAsTiff(self.raw_seg_membrane, os.path.join(self.tempDump, "seg-mask-"+self.current.getTitle()))
-
+        background_correction(ch3)
+        
+        mask = segment_with_weka(ch3, self.membrane_classifier_path, [2, 4], True)
+        self.membrane_mask = mask
+        
+        if self.dump:
+            IJ.saveAsTiff(self.membrane_mask, os.path.join(self.dump_path, "raw-membranes-"+self.current_title+".tif"))
+        
         return True
 
     def _postprocess(self):
@@ -170,93 +346,89 @@ class SpotsToMembrane(object):
         
         return False
 
-    def _clear_state(self):
-        if self.current is not None:
-            self.current.close()
-            self.current = None
-
-    def _get_image_path(self):
-        current_image = self.current
-        if current_image is None:
-            print("No image found.")
-            return None
-
-        file_info = current_image.getOriginalFileInfo()
-        if file_info is None:
-            print("The current image doesn't own file info.")
-            return None
-        
-        return os.path.join(file_info.directory, file_info.fileName)
-    
-    def _fetch_paths(self):
-        i_path = self._get_image_path()
-        if (i_path is None) or (not os.path.isfile(i_path)):
-            print("The image path doesn't correspond to any file.")
-            return False
-        
-        if self.noSpots:
-            print("The spots will be skipped.")
-            return True
-        
-        directory = os.path.dirname(i_path)
-        if not os.path.isdir(directory):
-            print("Failed to find the parent directory.")
-            return False
-        
-        # For files transfered from Windows to Linux:
-        name = os.path.basename(i_path)
-        csv_name_low = ".".join(name.split(".")[:-1]) + ".csv"
-        content = {n.lower(): n for n in os.listdir(directory)}
-        csv_name = content.get(csv_name_low, None)
-        if csv_name is None:
-            print("The spots associated to: " + name + " could not be found.")
-            return False
-        
-        self.image_path = i_path
-        self.spots_path = os.path.join(directory, csv_name)
-        return True
-
     def run(self, capture=True):
-        if capture:
-            try:
-                IJ.getImage()
-            except:
-                print("No image to work on.")
-                return False
-            self.current = IJ.getImage() # WindowManager.getCurrentImage()
-            print("Working on image: " + self.current.getTitle())
-        
-        if not self._fetch_paths():
-            print("Failed to fetch necessary paths.")
+
+        if not self._get_working_data(capture):
+            print("Failed to fetch some data required for processing.")
             return False
         
-        if not self._preprocess():
+        if not self._preprocess_cyto():
             print("Failed to preprocess the input image.")
             return False
         
-        if not self._segment():
+        if not self._segment_cyto():
+            print("Failed to make the rough segmentation of cytoplasm.")
+            return False
+        
+        if not self._segment_membranes():
             print("Failed to segment the stained membrane.")
             return False
         
-        if not self._postprocess():
-            print("Failed to postprocess the segmented image.")
-            return False
+        # if not self._postprocess():
+        #     print("Failed to postprocess the segmented image.")
+        #     return False
 
         return True
+    
+    def run_batch(self, folder, extension, rdq=False, earlyAbort=0):
+        
+        self.is_batch = True
 
-    def runBatch(self):
-        self.run(False)
+        if not os.path.isdir(folder):
+            print("The provided path is not a folder.")
+            return False
+        
+        self.queue = []
+
+        for f in os.listdir(folder):
+            full_path = os.path.join(folder, f)
+
+            if not os.path.isfile(full_path):
+                continue
+
+            if not f.lower().endswith(extension.lower()):
+                continue
+
+            self.queue.append(full_path)
+
+        if rdq:
+            shuffle(self.queue)
+
+        self._clear_state()
+        nChars = len(str(len(self.queue)))
+
+        for index, target in enumerate(self.queue):
+            self.dump_path = os.path.join(self.dump_path, "image_"+str(index).zfill(3))
+            os.mkdir(self.dump_path)
+            print("[" + str(index+1).zfill(nChars) + "/" + str(len(self.queue)) + "] Processing: " + target)
+            self.current = IJ.openImage(target)
+            self.run(False)
+            self._clear_state()
+            self.dump_path = os.path.dirname(self.dump_path)
+
+            if earlyAbort > 0 and index+1 >= earlyAbort:
+                break
+        
+        return True
 
 
 def main():
     stm = SpotsToMembrane()
-    if not stm.run():
-        print("An error occured. END.")
+
+    if not stm.set_spots_directory("/home/benedetti/Documents/projects/22-felipe-membrane-spots/images-felipe-no-tentacle/FL120-cells/positions-csv"):
+        print("ERROR.")
         return 1
+    
+    if not stm.run_batch("/home/benedetti/Documents/projects/22-felipe-membrane-spots/images-felipe-no-tentacle/FL120-cells/raw-files", ".ics", False, 1):
+        print("ERROR.")
+        return 1
+    
+    print("DONE.")
     return 0
 
 
-main()
+if __name__ == "__main__":
+    main()
 
 
 
@@ -270,6 +442,20 @@ Une erreur va être introduite pour les spots qui se trouvent proche de la zone 
 """ TODO
 Refaire un export sous forme d'image de tous les CSV de spots qui ont été fournis.
 Intégrer cela comme une méthode dans la classe.
+"""
+
+""" TODO
+Essayer de ne prendre le threshold qu'à partir de la slice du milieu
+"""
+
+""" TODO
+Pouvoir donner un chemin pour des ROIs de background (ou les chercher dans le même dossier avec le nom).
+"""
+
+""" TODO
+Essayer un UNet2D en slice par slice pour la segmentation de ce qui est du cyto ou non.
+Tester avec soit C1 soit C3 comme donnée d'input pour voir lequel donne le meilleur résultat.
+L'avantage de C1 est qu'on peut tenter de lui faire oublier les cellules non-marquées.
 """
 
 """TODO

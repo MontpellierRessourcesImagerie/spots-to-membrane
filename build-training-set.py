@@ -1,5 +1,5 @@
 import os
-from random import randint
+from random import randint, shuffle
 
 from ij import IJ, ImagePlus
 from ij.plugin import Duplicator, Concatenator
@@ -23,17 +23,21 @@ Description: Build a training set from a batch of images meant to be used with L
                    - We should also add some randomness (rotations, mirrors, ...)
 """
 
-###########  INIT AND SETTINGS #############
+###########  INIT, GLOBALS AND SETTINGS #############
 
 _dp      = Duplicator()
-_channel = 3 # Channel of interest
+_channel = 2 # Channel of interest
 _ext     = ".ics" # Extension of images in the folder.
-_path    = "/home/benedetti/Documents/projects/22-felipe-membrane-spots/imgs-felipe"
-_s_size  = 4 # Size (in slices) of a chunk from an image
+_s_size  = 5 # Size (in slices) of a chunk from an image
+_dcm_f   = 1 # Decimation factor
 _cct     = Concatenator()
 _ce      = ContrastEnhancer()
 _m       = Mirror()
 _bs      = BackgroundSubtracter()
+_paths   = [
+    # "/home/benedetti/Documents/projects/22-felipe-membrane-spots/imgs-felipe",
+    "/home/benedetti/Documents/projects/22-felipe-membrane-spots/images-felipe-no-tentacle/FL120-cells/raw-files"
+]
 
 #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -44,12 +48,27 @@ _ce.setUseStackHistogram(False)
 
 ############################################
 
-content = [f for f in os.listdir(_path) if f.endswith(_ext)]
-buffer  = []
+def getContent():
+    content = []
+    for path in _paths:
+        ext = [os.path.join(path, f) for f in os.listdir(path) if f.endswith(_ext)]
+        content += ext
+    
+    shuffle(content)
+    target_length = int(len(content) * _dcm_f)
+
+    return content[:target_length]
+
+
+############################################
+
+content = getContent() # All files used in the training set
+buffer  = [] # Buffer of stacks
 nFrames = 0
 
-for c in content:
-    full_path = os.path.join(_path, c)
+for n, c in enumerate(content):
+    full_path = c
+    print("[" + str(n+1) + "/" + str(len(content)) + "]." + " Processing " + c)
     imIn      = IJ.openImage(full_path)
     channel   = _dp.run(imIn, _channel, _channel, 1, imIn.getNSlices(), 1, 1)
     imIn.close()
@@ -71,9 +90,9 @@ for c in content:
         chunk = _dp.run(channel, 1, 1, start, end, 1, 1)
         img = Image.wrap(chunk)
         a = Axes(
-            randint(0, 1) != 0, 
-            randint(0, 1) != 0, 
-            randint(0, 1) != 0
+            False, # randint(0, 1) != 0, 
+            False, # randint(0, 1) != 0, 
+            False # randint(0, 1) != 0
         )
         _m.run(img, a)
         out = img.imageplus()
