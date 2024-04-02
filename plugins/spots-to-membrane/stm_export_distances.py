@@ -1,8 +1,10 @@
 from ij import IJ, ImagePlus
 from ij.gui import PointRoi
+from ij.plugin import Duplicator
 from ij.plugin.frame import RoiManager
 from ij.measure import ResultsTable
 from inra.ijpb.binary.distmap import ChamferMask3D
+from ij.plugin import RGBStackMerge
 from inra.ijpb.binary import BinaryImages
 from inra.ijpb.data.image import Images3D
 from ij.gui import Roi
@@ -35,52 +37,94 @@ def getValuesFromLocations(imChamfer, rm):
 
 
 def distanceTransform(imIn):
+    """
+    Takes as input the control image in which the first channel is the mask.
+    Extracts the mask and computes the distance transform.
+    The input image is supposed to be isotropic and calibrated.
+    Scales the quasi-Euclidean distance transform to micrometers.
+    """
+    dp = Duplicator()
+    mask = dp.run(imIn, 1, 1, 1, imIn.getNSlices(), 1, 1)
+    factor = mask.getCalibration().pixelWidth
     kernel = ChamferMask3D.QUASI_EUCLIDEAN
-    distStack = BinaryImages.distanceMap(imIn.getStack(), kernel, True, False)
+    distStack = BinaryImages.distanceMap(mask.getStack(), kernel, True, False)
     imOut = ImagePlus("Distance map", distStack)
-    imOut.setCalibration(imIn.getCalibration())
-    imIn.close()
+    for i in range(1, imOut.getNSlices()+1):
+        imOut.setSlice(i)
+        prc = imOut.getProcessor()
+        prc.multiply(factor)
+    mask.close()
     return imOut
 
 
-def extractDistances(imIn, rm, rt, threshold):
-    all_rois = rm.getRoisAsArray()
-    current = 0
-    print("Number of ROIs: ", len(all_rois))
-    print("Number of measures: ", rt.size())
+def extractDistances(distMap, rm, threshold):
+    rt = ResultsTable()
+    rt.reset()
+    index = 0
 
-    # Each measure will have to be added to the results table.
-    lines = {}
-    for i in range(rt.size()):
-        _ = rt.getValue("pX", i)
-        y = rt.getValue("pY", i)
-        z = rt.getValue("pZ", i)
-        id = (z, z, y)
-        lines[id] = i
-
-    measures = ResultsTable()
-
-    for i, roi in enumerate(all_rois):
-        name = rm.getName(i)
-        indices = tuple([int(k) for k in name.split('-')])
-        p = roi.getContainedPoints()[0]
-        imIn.setSlice(indices[0])
-        prc = imIn.getProcessor()
-        val = prc.getf(p.x, p.y)
-        print(val)
+    for i in range(rm.getCount()):
+        roi = rm.getRoi(i)
+        z = roi.getZPosition()
+        if not roi.isLineOrPoint():
+            continue
+        points = roi.getContainedPoints()
+        if len(points) != 1:
+            continue
+        x, y = int(points[0].x), int(points[0].y)
+        distMap.setSlice(z)
+        val = distMap.getProcessor().getf(x, y)
 
         if val > threshold:
             continue
+        
+        rt.addRow()
+        rt.setValue("ID", index, i)
+        rt.setValue("Distance (um)", index, val)
+        rt.setValue("X", index, x)
+        rt.setValue("Y", index, y)
+        rt.setValue("Z", index, z)
+        index += 1
+        rt.updateResults()
+    
+    
+    rt.show("distances-" + distMap.getTitle().replace("3-iso-mask-", ""))
 
-        measures.addRow()
-        measures.setValue("X", current, rt.getValue('X', lines[indices]))
-        measures.setValue("Y", current, rt.getValue('Y', lines[indices]))
-        measures.setValue("Z", current, rt.getValue('Z', lines[indices]))
-        measures.setValue("d", current, val)
-        measures.updateResults()
-        current += 1
 
-    measures.show("Measures-"+imIn.getTitle())
+def updateControl(control, distMap):
+    """
+    Updates the control image with the distance map.
+    """
+    dp = Duplicator()
+    mask8 = dp.run(control, 1, 1, 1, control.getNSlices(), 1, 1)
+    mask32 = ImagePlus(mask8.getTitle()+"-32", mask8.getStack().convertToFloat())
+    imOut = RGBStackMerge.mergeChannels([mask32, distMap], True)
+    imOut.setCalibration(control.getCalibration())
+    title = control.getTitle()
+    control.close()
+    mask32.close()
+    distMap.close()
+    imOut.setTitle(title)
+    imOut.setC(2)
+    IJ.run(imOut, "mpl-viridis", "")
+    return imOut
+
+
+def removeInvalidSpots(invalidPath):
+    rm = RoiManager.getInstance()
+    descr = open(invalidPath, "r")
+    content = [k for k in descr.read().split("\n") if len(k) > 1 and k.strip()[0] != "#"]
+    descr.close()
+    invalids = set()
+    for i in range(rm.getCount()):
+        name = rm.getName(i)
+        if name in content:
+            invalids.add(i)
+    if len(invalids) == 0:
+        return 0
+    rm.deselect()
+    invalids = list(invalids)
+    rm.setSelectedIndexes(invalids)
+    rm.runCommand("Delete")
 
 
 def main():
@@ -91,19 +135,17 @@ def main():
         print("Couldn't find a RoiManager.")
         return 1
     
-    rt = ResultsTable.getResultsTable()
-    if rt is None:
-        print("Couldn't find a ResultsTable.")
-        return 1
-    
-    mask = IJ.getImage()
-    name = mask.getTitle()
-    cb   = mask.getCalibration()
-    dist = distanceTransform(mask)
-    dist.setTitle(name)
-    dist.setCalibration(cb)
-    extractDistances(dist, rm, rt, distThreshold)
-    
+    control = IJ.getImage()
+    ppt = control.getProperty("invalid-spots-path")
+    removeInvalidSpots(ppt)
+
+    imName  = control.getTitle()
+    distMap = distanceTransform(control)
+    distMap.setTitle(imName)
+    extractDistances(distMap, rm, distThreshold)
+    control = updateControl(control, distMap)
+    control.show()
+
 
 if __name__ == "__main__":
     main()
